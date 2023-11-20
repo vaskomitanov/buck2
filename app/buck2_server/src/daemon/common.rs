@@ -172,7 +172,6 @@ impl HasCommandExecutor for CommandExecutorFactory {
                 cache_uploader: Arc::new(NoOpCacheUploader {}),
             });
         }
-
         let remote_executor_new = |options: &RemoteExecutorOptions,
                                    re_use_case: &RemoteExecutorUseCase,
                                    re_action_key: &Option<String>,

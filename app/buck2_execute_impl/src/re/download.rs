@@ -51,6 +51,7 @@ use futures::future;
 use futures::FutureExt;
 use gazebo::prelude::*;
 use indexmap::IndexMap;
+use buck2_execute::re::action_identity::ReActionIdentity;
 use more_futures::cancellation::CancellationContext;
 use remote_execution as RE;
 
@@ -63,6 +64,7 @@ pub async fn download_action_results<'a>(
     re_use_case: RemoteExecutorUseCase,
     digest_config: DigestConfig,
     manager: CommandExecutionManager,
+    identity: &ReActionIdentity<'_>,
     stage: buck2_data::executor_stage_start::Stage,
     paths: &CommandExecutionPaths,
     requested_outputs: impl IntoIterator<Item = CommandExecutionOutputRef<'a>>,
@@ -107,6 +109,7 @@ pub async fn download_action_results<'a>(
 
     let download = downloader.download(
         manager,
+        identity,
         stage,
         paths,
         requested_outputs,
@@ -149,6 +152,7 @@ impl CasDownloader<'_> {
     async fn download<'a>(
         &self,
         manager: CommandExecutionManager,
+        identity: &ReActionIdentity<'_>,
         stage: buck2_data::executor_stage_start::Stage,
         paths: &CommandExecutionPaths,
         requested_outputs: impl IntoIterator<Item = CommandExecutionOutputRef<'a>>,
@@ -164,7 +168,7 @@ impl CasDownloader<'_> {
     > {
         executor_stage_async(stage, async {
             let artifacts = self
-                .extract_artifacts(paths, requested_outputs, output_spec)
+                .extract_artifacts(identity, paths, requested_outputs, output_spec)
                 .await;
 
             let artifacts = match artifacts {
@@ -231,6 +235,7 @@ impl CasDownloader<'_> {
 
     async fn extract_artifacts<'a>(
         &self,
+        identity: &ReActionIdentity<'_>,
         paths: &CommandExecutionPaths,
         requested_outputs: impl IntoIterator<Item = CommandExecutionOutputRef<'a>>,
         output_spec: &dyn RemoteActionResult,
@@ -268,6 +273,7 @@ impl CasDownloader<'_> {
         let trees = self
             .re_client
             .download_typed_blobs::<RE::Tree>(
+                Some(identity),
                 output_spec
                     .output_directories()
                     .map(|x| x.tree_digest.clone()),
