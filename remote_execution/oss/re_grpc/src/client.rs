@@ -16,8 +16,11 @@ use anyhow::Context;
 use buck2_re_configuration::Buck2OssReConfiguration;
 use buck2_re_configuration::HttpHeader;
 use dupe::Dupe;
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use futures::future::BoxFuture;
 use futures::future::Future;
+use futures::FutureExt;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
@@ -80,6 +83,8 @@ use crate::response::*;
 const CONCURRENT_UPLOAD_LIMIT: usize = 64;
 
 const DEFAULT_MAX_MSG_SIZE: usize = 4 * 1000 * 1000;
+
+type BytestreamUploads = DashMap<TDigest, tokio::sync::broadcast::Sender<WriteResponse>>;
 
 fn tdigest_to(tdigest: TDigest) -> Digest {
     Digest {
@@ -403,6 +408,7 @@ pub struct REClient {
     grpc_clients: GRPCClients,
     capabilities: RECapabilities,
     instance_name: InstanceName,
+    bystream_uploads: BytestreamUploads,
 }
 
 impl Drop for REClient {
@@ -470,6 +476,7 @@ impl REClient {
             grpc_clients,
             capabilities,
             instance_name,
+            bystream_uploads: Default::default(),
         }
     }
 
@@ -627,28 +634,31 @@ impl REClient {
         metadata: RemoteExecutionMetadata,
         request: UploadRequest,
     ) -> anyhow::Result<UploadResponse> {
+        let cas_fut = |re_request| async {
+            let metadata = metadata.clone();
+            let mut cas_client = self.grpc_clients.cas_client.clone();
+            let resp = cas_client
+                .batch_update_blobs(with_internal_metadata(re_request, metadata))
+                .await?;
+            Ok(resp.into_inner())
+        };
+        let byt_fut = |segments| async {
+            let metadata = metadata.clone();
+            let mut bytestream_client = self.grpc_clients.bytestream_client.clone();
+            let requests = futures::stream::iter(segments);
+            let resp = bytestream_client
+                .write(with_internal_metadata(requests, metadata))
+                .await?;
+
+            Ok(resp.into_inner())
+        };
         upload_impl(
             &self.instance_name,
             request,
             self.capabilities.max_msg_size,
-            |re_request| async {
-                let metadata = metadata.clone();
-                let mut cas_client = self.grpc_clients.cas_client.clone();
-                let resp = cas_client
-                    .batch_update_blobs(with_internal_metadata(re_request, metadata))
-                    .await?;
-                Ok(resp.into_inner())
-            },
-            |segments| async {
-                let metadata = metadata.clone();
-                let mut bytestream_client = self.grpc_clients.bytestream_client.clone();
-                let requests = futures::stream::iter(segments);
-                let resp = bytestream_client
-                    .write(with_internal_metadata(requests, metadata))
-                    .await?;
-
-                Ok(resp.into_inner())
-            },
+            cas_fut,
+            byt_fut,
+            &self.bystream_uploads,
         )
         .await
     }
@@ -1045,6 +1055,7 @@ async fn upload_impl<Byt, Cas>(
     max_msg_size: usize,
     cas_f: impl Fn(BatchUpdateBlobsRequest) -> Cas + Sync + Send + Copy,
     bystream_fut: impl Fn(Vec<WriteRequest>) -> Byt + Sync + Send + Copy,
+    bystream_uploads: &BytestreamUploads,
 ) -> anyhow::Result<UploadResponse>
 where
     Cas: Future<Output = anyhow::Result<BatchUpdateBlobsResponse>> + Send,
@@ -1052,6 +1063,7 @@ where
 {
     // NOTE if we stop recording blob_hashes, we can drop out a lot of allocations.
     let mut upload_futures: Vec<BoxFuture<anyhow::Result<Vec<String>>>> = vec![];
+    let mut wait_upload_futures: Vec<BoxFuture<anyhow::Result<Vec<String>>>> = vec![];
 
     // For small file uploads the client should group them together and call `BatchUpdateBlobs`
     // https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto#L205
@@ -1088,34 +1100,70 @@ where
                 });
             }
             upload_segments.last_mut().unwrap().finish_write = true;
-
             let resp = bystream_fut(upload_segments).await?;
             if resp.committed_size != size {
                 return Err(anyhow::anyhow!(
                     "Failed to upload inline blob: invalid committed_size from WriteResponse"
                 ));
             }
-
             Ok(vec![hash])
         };
         upload_futures.push(Box::pin(fut));
     }
 
     // Create futures for any files that needs uploading.
-    for file in request.files_with_digest.unwrap_or_default() {
-        let hash = file.digest.hash.clone();
-        let size = file.digest.size_in_bytes;
-        let name = file.name.clone();
-        if size < max_msg_size as i64 {
-            batched_blob_updates.push(BatchUploadRequest::File(file));
+    let mut named_digests = vec![];
+    for named_digest in request.files_with_digest.unwrap_or_default() {
+        if named_digest.digest.size_in_bytes < max_msg_size as i64 {
+            batched_blob_updates.push(BatchUploadRequest::File(named_digest));
             continue;
         }
+        match bystream_uploads.entry(named_digest.digest.clone()) {
+            Entry::Occupied(occ) => {
+                let digest = named_digest.digest.clone();
+                tracing::info!("Duplicate upload of resource: {}", &digest);
+                wait_upload_futures.push(Box::pin(async move {
+                    let tx= occ.get();
+                    if tx.receiver_count() > 0 {
+                        let mut rx = tx.subscribe();
+                        let resp = rx.recv().await?;
+                        if resp.committed_size != digest.size_in_bytes {
+                            return Err(anyhow::anyhow!(
+                                "Failed to upload `{}`: invalid committed_size from WriteResponse", digest
+                            ));
+                        }
+                    }
+                    Ok(vec![digest.hash])
+                }));
+            }
+            Entry::Vacant(vac) => {
+                let digest = named_digest.digest.clone();
+                tracing::info!("First occurrence of resource upload: {}", &digest);
+                let (tx, mut rx) = tokio::sync::broadcast::channel(10000);
+                wait_upload_futures.push(Box::pin(async move {
+                    let resp: WriteResponse = rx.recv().await?;
+                    if resp.committed_size != digest.size_in_bytes {
+                        return Err(anyhow::anyhow!(
+                            "Failed to upload `{}`: invalid committed_size from WriteResponse", digest
+                        ));
+                    }
+                    Ok(vec![digest.hash])
+                }));
+                vac.insert(tx.clone());
+                named_digests.push((tx, named_digest));
+            }
+        }
+    }
+    for (tx, named_digest) in named_digests {
+        let name = named_digest.name.clone();
+        let size = named_digest.digest.size_in_bytes;
+        let hash = named_digest.digest.hash.clone();
         let client_uuid = uuid::Uuid::new_v4().to_string();
         let resource_name = format!(
             "{}uploads/{}/blobs/{}/{}",
             instance_name.as_resource_prefix(),
             client_uuid,
-            hash.clone(),
+            &hash,
             size
         );
         let fut = async move {
@@ -1147,14 +1195,35 @@ where
                 .with_context(|| format!("Read no segments from `{name} "))?
                 .finish_write = true;
 
-            let resp = bystream_fut(upload_segments).await?;
-            if resp.committed_size != size {
-                return Err(anyhow::anyhow!(
-                    "Failed to upload `{name}`: invalid committed_size from WriteResponse"
-                ));
+            match bystream_fut(upload_segments).await {
+                Ok(resp) => {
+                    if resp.committed_size != size {
+                        Err(anyhow::anyhow!(
+                            "Failed to upload `{hash}`: invalid committed_size from WriteResponse"
+                        ))
+                    } else {
+                        Ok((named_digest.digest, resp))
+                    }
+                },
+                Err(err) => Err(err)
             }
-            Ok(vec![hash])
-        };
+        }.then(|result| async move {
+            match result {
+                Ok((digest, resp)) => {
+                    if let Err(err) = tx.send(resp) {
+                        tracing::error!("Error informing: {} write done!", &digest);
+                        Err(anyhow::anyhow!(
+                            "Error notifying receivers about completed upload: {err}"
+                        ))
+                    } else {
+                        Ok(vec![digest.hash])
+                    }
+                },
+                Err(err) => {
+                    Err(err)
+                }
+            }
+        });
         upload_futures.push(Box::pin(fut));
     }
 
@@ -1226,11 +1295,13 @@ where
         upload_futures.push(Box::pin(fut));
     }
 
+    upload_futures.append(&mut wait_upload_futures);
+
     let upload_stream =
         futures::stream::iter(upload_futures).buffer_unordered(CONCURRENT_UPLOAD_LIMIT);
     let blob_hashes = upload_stream.try_collect::<Vec<Vec<String>>>().await?;
 
-    tracing::debug!("uploaded: {:?}", blob_hashes);
+    tracing::info!("uploaded: {:?}", blob_hashes);
     Ok(UploadResponse {})
 }
 
