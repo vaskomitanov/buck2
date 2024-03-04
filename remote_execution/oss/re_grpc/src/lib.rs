@@ -14,6 +14,8 @@ mod grpc;
 mod metadata;
 mod request;
 mod response;
+mod broadcaster;
+
 pub use client::*;
 pub use error::*;
 pub use grpc::*;

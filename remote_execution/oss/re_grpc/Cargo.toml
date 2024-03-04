@@ -14,9 +14,11 @@ futures = { workspace = true }
 gazebo = { workspace = true }
 http = { workspace = true }
 once_cell = { workspace = true }
+parking_lot = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 regex = { workspace = true }
+slab = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

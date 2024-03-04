@@ -71,6 +71,7 @@ use tonic::transport::Certificate;
 use tonic::transport::Channel;
 use tonic::transport::Identity;
 use tonic::transport::Uri;
+use crate::broadcaster;
 
 use crate::error::*;
 use crate::metadata::*;
@@ -84,7 +85,7 @@ const CONCURRENT_UPLOAD_LIMIT: usize = 64;
 
 const DEFAULT_MAX_MSG_SIZE: usize = 4 * 1000 * 1000;
 
-type BytestreamUploads = DashMap<TDigest, tokio::sync::broadcast::Sender<WriteResponse>>;
+type BytestreamUploads = DashMap<TDigest, broadcaster::BroadcastChannel<WriteResponse>>;
 
 fn tdigest_to(tdigest: TDigest) -> Digest {
     Digest {
@@ -1123,14 +1124,11 @@ where
                 let digest = named_digest.digest.clone();
                 tracing::info!("Duplicate upload of resource: {}", &digest);
                 wait_upload_futures.push(Box::pin(async move {
-                    let tx= occ.get();
-                    if tx.receiver_count() > 0 {
-                        let mut rx = tx.subscribe();
-                        let resp = rx.recv().await?;
+                    if let Some(resp) = occ.get().clone().recv().await {
                         if resp.committed_size != digest.size_in_bytes {
                             return Err(anyhow::anyhow!(
-                                "Failed to upload `{}`: invalid committed_size from WriteResponse", digest
-                            ));
+                            "Failed to upload `{}`: invalid committed_size from WriteResponse", digest
+                        ));
                         }
                     }
                     Ok(vec![digest.hash])
@@ -1139,18 +1137,20 @@ where
             Entry::Vacant(vac) => {
                 let digest = named_digest.digest.clone();
                 tracing::info!("First occurrence of resource upload: {}", &digest);
-                let (tx, mut rx) = tokio::sync::broadcast::channel(10000);
+                let mut channel: broadcaster::BroadcastChannel<WriteResponse>  = broadcaster::BroadcastChannel::new();
+                vac.insert(channel.clone());
+                named_digests.push((channel.clone(), named_digest));
                 wait_upload_futures.push(Box::pin(async move {
-                    let resp: WriteResponse = rx.recv().await?;
-                    if resp.committed_size != digest.size_in_bytes {
-                        return Err(anyhow::anyhow!(
+                    if let Some(resp) = channel.recv().await {
+                        if resp.committed_size != digest.size_in_bytes {
+                            return Err(anyhow::anyhow!(
                             "Failed to upload `{}`: invalid committed_size from WriteResponse", digest
                         ));
+                        }
                     }
                     Ok(vec![digest.hash])
                 }));
-                vac.insert(tx.clone());
-                named_digests.push((tx, named_digest));
+
             }
         }
     }
@@ -1210,7 +1210,7 @@ where
         }.then(|result| async move {
             match result {
                 Ok((digest, resp)) => {
-                    if let Err(err) = tx.send(resp) {
+                    if let Err(err) = tx.send(&resp).await {
                         tracing::error!("Error informing: {} write done!", &digest);
                         Err(anyhow::anyhow!(
                             "Error notifying receivers about completed upload: {err}"
@@ -1299,6 +1299,7 @@ where
 
     let upload_stream =
         futures::stream::iter(upload_futures).buffer_unordered(CONCURRENT_UPLOAD_LIMIT);
+
     let blob_hashes = upload_stream.try_collect::<Vec<Vec<String>>>().await?;
 
     tracing::info!("uploaded: {:?}", blob_hashes);
